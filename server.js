@@ -12,10 +12,7 @@ app.use(express.json({ limit: "5mb" }));
 const PORT = process.env.PORT || 10000;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
 
-// In-memory job store (MVP)
 const jobs = new Map();
-
-/* -------------------- UTILITIES -------------------- */
 
 function setJob(jobId, patch) {
   jobs.set(jobId, { ...(jobs.get(jobId) || {}), ...patch });
@@ -24,9 +21,7 @@ function setJob(jobId, patch) {
 function runFfmpegAll(args) {
   const r = spawnSync("ffmpeg", args, { encoding: "utf8" });
   const combined = (r.stdout || "") + "\n" + (r.stderr || "");
-  if (r.status !== 0) {
-    throw new Error(combined.slice(-2000));
-  }
+  if (r.status !== 0) throw new Error(combined.slice(-2000));
   return combined;
 }
 
@@ -75,23 +70,28 @@ function tempoPitch(speed, semitones) {
   ].join(",");
 }
 
-/* -------------------- ROUTES -------------------- */
-
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.post("/enhance", async (req, res) => {
   try {
-    const {
-      inputFileUrl,
-      enhancementType,
-      speedMultiplier = 1,
-      pitchSemitones = 0,
-      focus = "none",
-      masterProfile = "streaming"
-    } = req.body || {};
+    const body = req.body || {};
+    const inputFileUrl = body.inputFileUrl;
+    const enhancementType = body.enhancementType;
 
-    if (!inputFileUrl || !["mix", "master", "4d"].includes(enhancementType)) {
-      return res.status(400).json({ error: "Invalid request" });
+    const speedMultiplier = Number(body.speedMultiplier ?? 1);
+    const pitchSemitones = Number(body.pitchSemitones ?? 0);
+    const focus = String(body.focus ?? "none");
+    const masterProfile = String(body.masterProfile ?? "streaming");
+
+    if (!inputFileUrl) return res.status(400).json({ error: "Missing inputFileUrl" });
+    if (!["mix", "master", "4d"].includes(enhancementType)) {
+      return res.status(400).json({ error: "Invalid enhancementType" });
+    }
+    if (!(speedMultiplier >= 0.5 && speedMultiplier <= 2.0)) {
+      return res.status(400).json({ error: "Invalid speedMultiplier" });
+    }
+    if (!(pitchSemitones >= -4 && pitchSemitones <= 4)) {
+      return res.status(400).json({ error: "Invalid pitchSemitones" });
     }
 
     const jobId = nanoid();
@@ -104,9 +104,7 @@ app.post("/enhance", async (req, res) => {
       pitchSemitones,
       focus,
       masterProfile
-    }).catch(e => {
-      setJob(jobId, { status: "failed", error: e.message });
-    });
+    }).catch((e) => setJob(jobId, { status: "failed", error: e.message }));
 
     res.json({ jobId });
   } catch (e) {
@@ -126,29 +124,28 @@ app.get("/download/:id", (req, res) => {
   res.download(out, `enhanced-${req.params.id}.wav`);
 });
 
-/* -------------------- PROCESSING -------------------- */
-
 async function processJob(jobId, opts) {
-  setJob(jobId, { status: "processing", step: "Downloading audio…" });
+  setJob(jobId, { status: "processing", step: "Downloading audio..." });
 
   const dir = `/tmp/${jobId}`;
   fs.mkdirSync(dir, { recursive: true });
 
-  const raw = path.join(dir, "input");
+  const raw = path.join(dir, "input.bin");
   const wav = path.join(dir, "decoded.wav");
   const out = path.join(dir, "output.wav");
 
   const r = await fetch(opts.inputFileUrl);
-  if (!r.ok) throw new Error("Failed to fetch input file");
+  if (!r.ok) throw new Error(`Failed to fetch input file: ${r.status}`);
   fs.writeFileSync(raw, Buffer.from(await r.arrayBuffer()));
 
+  setJob(jobId, { step: "Preparing audio..." });
   runFfmpegAll(["-y", "-i", raw, "-ac", "2", "-ar", "48000", wav]);
 
   const focusFilter = getFocusFilter(opts.focus);
   const tempo = tempoPitch(opts.speedMultiplier, opts.pitchSemitones);
 
   if (opts.enhancementType === "mix") {
-    setJob(jobId, { step: "Mixing track…" });
+    setJob(jobId, { step: "Mixing track..." });
     const af = [
       "highpass=f=30",
       "lowpass=f=18000",
@@ -163,4 +160,50 @@ async function processJob(jobId, opts) {
     runFfmpegAll(["-y", "-i", wav, "-af", af, out]);
   }
 
-  if (opts.enhancementType === "4d
+  if (opts.enhancementType === "4d") {
+    setJob(jobId, { step: "Creating 4D space..." });
+    const af = [
+      "highpass=f=30",
+      "stereotools=mlev=1:slev=1.25",
+      "apulsator=hz=0.12:amount=0.35",
+      focusFilter,
+      tempo,
+      "alimiter=limit=0.98"
+    ].filter(Boolean).join(",");
+
+    runFfmpegAll(["-y", "-i", wav, "-af", af, out]);
+  }
+
+  if (opts.enhancementType === "master") {
+    setJob(jobId, { step: "Analyzing loudness..." });
+    const t = getMasterTarget(opts.masterProfile);
+
+    const analysis = runFfmpegAll([
+      "-i", wav,
+      "-af", `loudnorm=I=${t.I}:TP=${t.TP}:LRA=${t.LRA}:print_format=json`,
+      "-f", "null", "-"
+    ]);
+
+    const m = parseLoudnormJson(analysis);
+    if (!m) throw new Error("Loudness analysis failed");
+
+    setJob(jobId, { step: "Mastering audio..." });
+
+    const af = [
+      "highpass=f=25",
+      "acompressor=threshold=-20dB:ratio=2:attack=10:release=100:makeup=2",
+      focusFilter,
+      tempo,
+      `loudnorm=I=${t.I}:TP=${t.TP}:LRA=${t.LRA}:measured_I=${m.input_i}:measured_TP=${m.input_tp}:measured_LRA=${m.input_lra}:measured_thresh=${m.input_thresh}:offset=${m.target_offset}:linear=true`,
+      "alimiter=limit=0.98"
+    ].filter(Boolean).join(",");
+
+    runFfmpegAll(["-y", "-i", wav, "-af", af, out]);
+  }
+
+  setJob(jobId, { status: "done", enhancedFileUrl: `${PUBLIC_BASE_URL}/download/${jobId}` });
+}
+
+app.listen(PORT, () => {
+  console.log(`Audio engine running on ${PORT}`);
+});
