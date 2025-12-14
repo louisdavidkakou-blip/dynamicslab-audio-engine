@@ -11,17 +11,13 @@ app.use(cors());
 app.use(express.json({ limit: "5mb" }));
 
 const PORT = process.env.PORT || 10000;
-
-// IMPORTANT: set this in Render ENV so download links are clickable anywhere
-// e.g. PUBLIC_BASE_URL = https://dynamicslab-audio-engine.onrender.com
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
 
-// In-memory jobs (fine for MVP testing). For production use DB/Redis.
+// In-memory jobs (MVP). Production: Redis/DB + object storage for outputs.
 const jobs = new Map();
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// Useful for diagnosing outbound internet/DNS from Render
 app.get("/net-test", async (req, res) => {
   try {
     const r = await fetch("https://example.com", { method: "GET" });
@@ -31,12 +27,93 @@ app.get("/net-test", async (req, res) => {
   }
 });
 
+function setJob(jobId, patch) {
+  const prev = jobs.get(jobId) || {};
+  jobs.set(jobId, { ...prev, ...patch });
+}
+
+function runFfmpeg(cmd) {
+  try {
+    return execSync(cmd, { stdio: ["ignore", "pipe", "pipe"] }).toString();
+  } catch (e) {
+    // ffmpeg often writes details to stderr
+    const out = (e?.stdout?.toString() || "") + "\n" + (e?.stderr?.toString() || "");
+    throw new Error(out.trim() || String(e?.message || e));
+  }
+}
+
+function parseLoudnormJson(mixedOutput) {
+  const start = mixedOutput.indexOf("{");
+  const end = mixedOutput.lastIndexOf("}");
+  if (start === -1 || end === -1) return null;
+  try {
+    return JSON.parse(mixedOutput.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+function getMasterTarget(profile) {
+  // Practical streaming targets (safe + consistent)
+  if (profile === "apple_music") return { I: -16, TP: -1.0, LRA: 11 };
+  if (profile === "loud") return { I: -10, TP: -0.8, LRA: 8 };
+  // default streaming / spotify-ish
+  return { I: -14, TP: -1.0, LRA: 10 };
+}
+
+function getFocusFilters(focus) {
+  switch (focus) {
+    case "bass":
+      return "equalizer=f=90:t=q:w=1:g=2.0";
+    case "presence":
+      return "equalizer=f=3500:t=q:w=1:g=2.0";
+    case "air":
+      return "equalizer=f=12000:t=q:w=1:g=2.0";
+    case "wide":
+      return "stereotools=mlev=1.0:slev=1.20";
+    case "punch":
+      // “punch” feel via faster attack/release compression (not true transient shaping)
+      return "acompressor=threshold=-16dB:ratio=2.5:attack=8:release=80:makeup=2";
+    default:
+      return "";
+  }
+}
+
+function buildTempoPitchFilters({ speedMultiplier, pitchSemitones = 0 }) {
+  // Stabilize first (reduces time-stretch artifacts)
+  const base = ["aresample=48000:resampler=soxr:precision=28", "aformat=sample_fmts=fltp:channel_layouts=stereo"];
+
+  // Tempo (atempo supports 0.5–2.0)
+  const tempo = `atempo=${speedMultiplier}`;
+
+  // Pitch shift (without keeping tempo) using sample-rate trick + compensation
+  if (!pitchSemitones || pitchSemitones === 0) {
+    return [...base, tempo].join(",");
+  }
+
+  const ratio = Math.pow(2, pitchSemitones / 12);
+
+  const pitch = [
+    `asetrate=48000*${ratio}`,
+    "aresample=48000:resampler=soxr:precision=28",
+    // compensate tempo so duration doesn't drift unexpectedly
+    `atempo=${1 / ratio}`,
+  ].join(",");
+
+  return [...base, tempo, pitch].join(",");
+}
+
 app.post("/enhance", async (req, res) => {
   try {
     const { inputFileUrl, enhancementType } = req.body || {};
+
     const speedMultiplier = Number(req.body?.speedMultiplier ?? 1.0);
 
-    // Validation
+    // Optional controls
+    const focus = String(req.body?.focus ?? "none"); // none|bass|presence|air|wide|punch
+    const masterProfile = String(req.body?.masterProfile ?? "streaming"); // streaming|apple_music|loud
+    const pitchSemitones = Number(req.body?.pitchSemitones ?? 0); // e.g. -1 for slowed
+
     if (!inputFileUrl || !enhancementType) {
       return res.status(400).json({
         error: "Missing required fields",
@@ -52,21 +129,33 @@ app.post("/enhance", async (req, res) => {
     }
 
     if (!(speedMultiplier >= 0.5 && speedMultiplier <= 2.0)) {
-      return res.status(400).json({
-        error: "Invalid speedMultiplier (must be between 0.5 and 2.0)",
-      });
+      return res.status(400).json({ error: "Invalid speedMultiplier (0.5–2.0)" });
+    }
+
+    if (!["none", "bass", "presence", "air", "wide", "punch"].includes(focus)) {
+      return res.status(400).json({ error: "Invalid focus option" });
+    }
+
+    if (!["streaming", "apple_music", "loud"].includes(masterProfile)) {
+      return res.status(400).json({ error: "Invalid masterProfile" });
+    }
+
+    if (!(pitchSemitones >= -4 && pitchSemitones <= 4)) {
+      return res.status(400).json({ error: "pitchSemitones out of range (-4 to 4)" });
     }
 
     const jobId = nanoid();
     jobs.set(jobId, { status: "queued", createdAt: Date.now() });
 
-    // Fire-and-forget
-    processJob(jobId, { inputFileUrl, enhancementType, speedMultiplier }).catch((e) => {
-      jobs.set(jobId, {
-        status: "failed",
-        error: String(e?.message || e),
-        failedAt: Date.now(),
-      });
+    processJob(jobId, {
+      inputFileUrl,
+      enhancementType,
+      speedMultiplier,
+      pitchSemitones,
+      focus,
+      masterProfile,
+    }).catch((e) => {
+      setJob(jobId, { status: "failed", error: String(e?.message || e), failedAt: Date.now() });
     });
 
     res.json({ jobId });
@@ -81,87 +170,148 @@ app.get("/jobs/:jobId", (req, res) => {
   res.json(job);
 });
 
-async function processJob(jobId, { inputFileUrl, enhancementType, speedMultiplier }) {
-  jobs.set(jobId, { status: "processing", step: "Downloading input…" });
+async function processJob(jobId, { inputFileUrl, enhancementType, speedMultiplier, pitchSemitones, focus, masterProfile }) {
+  setJob(jobId, { status: "processing", step: "Downloading track…" });
 
-  // workspace
   const workdir = `/tmp/${jobId}`;
   fs.mkdirSync(workdir, { recursive: true });
 
-  // We keep original extension irrelevant; we decode into wav internally
-  const inPath = path.join(workdir, "input");
+  const rawPath = path.join(workdir, "input.raw");
+  const decodedWav = path.join(workdir, "decoded.wav");
   const outPath = path.join(workdir, "output.wav");
 
-  // Download input
+  // Download
   const r = await fetch(inputFileUrl);
   if (!r.ok) throw new Error(`Failed to fetch inputFileUrl: HTTP ${r.status}`);
-
   const buf = Buffer.from(await r.arrayBuffer());
   if (!buf?.length) throw new Error("Downloaded input file is empty");
+  fs.writeFileSync(rawPath, buf);
 
-  fs.writeFileSync(inPath, buf);
+  // Decode to stable WAV (prevents many atempo glitches)
+  setJob(jobId, { step: "Preparing audio…" });
+  runFfmpeg(`ffmpeg -y -i "${rawPath}" -ac 2 -ar 48000 -c:a pcm_s16le "${decodedWav}"`);
 
-  // Build FFmpeg filter chain
-  jobs.set(jobId, { status: "processing", step: "Applying enhancement…" });
+  // Build enhancement filters
+  const focusFilter = getFocusFilters(focus);
+  const tempoPitch = buildTempoPitchFilters({ speedMultiplier, pitchSemitones });
 
-  let af = "";
+  // MIX chain: cleanup + gentle comp + limiter
+  let mixCore = [
+    "highpass=f=30",
+    "lowpass=f=18000",
+    "equalizer=f=250:t=q:w=1:g=-2",       // reduce mud
+    "equalizer=f=3500:t=q:w=1:g=1.5",     // presence
+    "acompressor=threshold=-18dB:ratio=3:attack=20:release=120:makeup=4",
+  ];
 
-  if (enhancementType === "mix") {
-    af = [
-      "highpass=f=30",
-      "lowpass=f=18000",
-      "equalizer=f=250:t=q:w=1:g=-2",
-      "equalizer=f=3500:t=q:w=1:g=1.5",
-      "acompressor=threshold=-18dB:ratio=3:attack=20:release=120:makeup=4",
-      "stereotools=mlev=1.0:slev=1.12",
-    ].join(",");
+  // MASTER chain: we will do analysis + loudnorm + final limiter
+  // Before loudnorm we can do gentle tone shaping + glue compression
+  let masterPre = [
+    "highpass=f=25",
+    "acompressor=threshold=-20dB:ratio=2:attack=10:release=100:makeup=2",
+  ];
+
+  // 4D chain: movement + depth + limiter
+  let d4Core = [
+    "highpass=f=30",
+    "stereotools=mlev=1.0:slev=1.25",
+    "apulsator=hz=0.12:amount=0.35",
+    "aecho=0.8:0.85:40:0.15",
+  ];
+
+  // Add focus (optional) into chains
+  if (focusFilter) {
+    mixCore.push(focusFilter);
+    masterPre.push(focusFilter);
+    d4Core.push(focusFilter);
   }
 
-  if (enhancementType === "master") {
-    af = [
-      "highpass=f=25",
-      "equalizer=f=120:t=q:w=1:g=1.2",
-      "equalizer=f=4500:t=q:w=1:g=1.0",
-      "acompressor=threshold=-20dB:ratio=2:attack=10:release=100:makeup=3",
-      "alimiter=limit=0.95",
-    ].join(",");
+  // Add widen subtly for mix (only if user requested "wide" it already did more)
+  if (focus !== "wide") mixCore.push("stereotools=mlev=1.0:slev=1.12");
+
+  // Add limiter at end (mix + 4d). Master uses loudnorm + limiter after.
+  const mixLimiter = "alimiter=limit=0.99:attack=5:release=80";
+  const d4Limiter = "alimiter=limit=0.98:attack=3:release=60";
+
+  // Build final filter depending on type
+  if (enhancementType === "mix") {
+    setJob(jobId, { step: "Mixing (balance, EQ, dynamics)..." });
+
+    const af = [...mixCore, tempoPitch, mixLimiter].join(",");
+    setJob(jobId, { step: "Rendering mix..." });
+
+    runFfmpeg(`ffmpeg -y -i "${decodedWav}" -af "${af}" "${outPath}"`);
   }
 
   if (enhancementType === "4d") {
-    af = [
-      "highpass=f=30",
-      "stereotools=mlev=1.0:slev=1.25",
-      "apulsator=hz=0.12:amount=0.35",
-      "aecho=0.8:0.85:40:0.15",
-      "alimiter=limit=0.95",
-    ].join(",");
+    setJob(jobId, { step: "Designing spatial depth..." });
+
+    const af = [...d4Core, tempoPitch, d4Limiter].join(",");
+    setJob(jobId, { step: "Rendering 4D audio..." });
+
+    runFfmpeg(`ffmpeg -y -i "${decodedWav}" -af "${af}" "${outPath}"`);
   }
 
-  // Speed last
-  jobs.set(jobId, { status: "processing", step: `Time-stretching to ${speedMultiplier}x…` });
-  const speedFilter = `atempo=${speedMultiplier}`;
+  if (enhancementType === "master") {
+    setJob(jobId, { step: "Analyzing loudness (LUFS/True Peak)..." });
 
-  const filter = af ? `${af},${speedFilter}` : speedFilter;
+    const target = getMasterTarget(masterProfile);
 
-  // Run FFmpeg
-  // IMPORTANT: don’t hide errors while debugging; capture stderr
-  jobs.set(jobId, { status: "processing", step: "Rendering audio…" });
+    // 1) Measure loudness (first pass)
+    const measureCmd = `ffmpeg -i "${decodedWav}" -af "loudnorm=I=${target.I}:TP=${target.TP}:LRA=${target.LRA}:print_format=json" -f null -`;
+    let mixedOut = "";
+    try {
+      mixedOut = execSync(measureCmd, { stdio: ["ignore", "pipe", "pipe"] }).toString();
+    } catch (e) {
+      mixedOut = (e?.stdout?.toString() || "") + "\n" + (e?.stderr?.toString() || "");
+    }
 
-  try {
-    execSync(`ffmpeg -y -i "${inPath}" -af "${filter}" "${outPath}"`, {
-      stdio: "pipe", // capture errors
+    const measured = parseLoudnormJson(mixedOut);
+    if (!measured) throw new Error("Could not read loudnorm measurement JSON");
+
+    // 2) Build a smarter “pre” chain (conditional-ish)
+    // We can’t fully detect low-end vs highs perfectly without deeper DSP,
+    // but loudnorm alone will stabilize loudness + true peak.
+    // We add gentle tone shaping + glue before loudnorm:
+    setJob(jobId, { step: "Applying mastering chain..." });
+
+    const tone = [
+      // Mild “balance” EQ (very gentle)
+      "equalizer=f=120:t=q:w=1:g=1.0",
+      "equalizer=f=4500:t=q:w=1:g=0.8",
+    ];
+
+    const ln2 = `loudnorm=I=${target.I}:TP=${target.TP}:LRA=${target.LRA}:` +
+      `measured_I=${measured.input_i}:measured_TP=${measured.input_tp}:measured_LRA=${measured.input_lra}:` +
+      `measured_thresh=${measured.input_thresh}:offset=${measured.target_offset}:linear=true:print_format=summary`;
+
+    const masterLimiter = "alimiter=limit=0.98:attack=2:release=50";
+
+    const af = [
+      ...masterPre,
+      ...tone,
+      tempoPitch,
+      ln2,
+      masterLimiter,
+    ].join(",");
+
+    setJob(jobId, {
+      step:
+        masterProfile === "apple_music"
+          ? "Finalizing Apple Music-safe master..."
+          : masterProfile === "loud"
+            ? "Finalizing loud master..."
+            : "Finalizing streaming master..."
     });
-  } catch (e) {
-    const msg = e?.stderr ? e.stderr.toString() : String(e?.message || e);
-    throw new Error(`FFmpeg failed: ${msg}`);
+
+    runFfmpeg(`ffmpeg -y -i "${decodedWav}" -af "${af}" "${outPath}"`);
   }
 
   if (!fs.existsSync(outPath)) throw new Error("Output file missing after render");
   const stat = fs.statSync(outPath);
   if (!stat.size) throw new Error("Output file is empty");
 
-  // Mark as done with ABSOLUTE download URL
-  jobs.set(jobId, {
+  setJob(jobId, {
     status: "done",
     finishedAt: Date.now(),
     enhancedFileUrl: `${PUBLIC_BASE_URL}/download/${jobId}`,
@@ -176,4 +326,3 @@ app.get("/download/:jobId", (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Audio engine running on :${PORT}`));
-
