@@ -1,6 +1,5 @@
 import express from "express";
 import cors from "cors";
-import fetch from "node-fetch";
 import { nanoid } from "nanoid";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
