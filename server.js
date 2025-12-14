@@ -4,6 +4,7 @@ import fetch from "node-fetch";
 import { nanoid } from "nanoid";
 import { execSync } from "node:child_process";
 import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 
 const app = express();
