@@ -12,13 +12,11 @@ app.use(express.json({ limit: "5mb" }));
 const PORT = process.env.PORT || 10000;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
 
-// IMPORTANT: Render's filesystem is ephemeral. This is fine for MVP logging.
-// Tomorrow we can switch this to a DB (Supabase/Postgres) or object storage.
-const CLASSIFICATION_LOG_PATH = process.env.CLASSIFICATION_LOG_PATH || "/tmp/classification.ndjson";
+// Ephemeral MVP log (tomorrow move to DB)
+const CLASSIFICATION_LOG_PATH =
+  process.env.CLASSIFICATION_LOG_PATH || "/tmp/classification.ndjson";
 
 const jobs = new Map();
-
-// Simple in-memory cache of recent classification events
 const classificationEvents = [];
 
 function setJob(jobId, patch) {
@@ -28,7 +26,7 @@ function setJob(jobId, patch) {
 function runFfmpegAll(args) {
   const r = spawnSync("ffmpeg", args, { encoding: "utf8" });
   const combined = (r.stdout || "") + "\n" + (r.stderr || "");
-  if (r.status !== 0) throw new Error(combined.slice(-2000));
+  if (r.status !== 0) throw new Error(combined.slice(-2500));
   return combined;
 }
 
@@ -51,6 +49,18 @@ function parseLoudnormJson(text) {
   }
 }
 
+function logClassification(event) {
+  const line = JSON.stringify(event) + "\n";
+  classificationEvents.push(event);
+  if (classificationEvents.length > 500) classificationEvents.shift();
+  try {
+    fs.appendFileSync(CLASSIFICATION_LOG_PATH, line);
+  } catch {
+    // ignore for MVP
+  }
+}
+
+/** Platform mastering targets */
 function getMasterTarget(profile) {
   if (profile === "apple_music") return { I: -16, TP: -1.0, LRA: 11 };
   if (profile === "soundcloud") return { I: -13, TP: -1.0, LRA: 10 };
@@ -59,6 +69,15 @@ function getMasterTarget(profile) {
   return { I: -14, TP: -1.0, LRA: 10 };
 }
 
+/**
+ * MIX SAFETY TARGET (balanced, never crushed):
+ * -16 LUFS integrated and -1.2 dBTP true peak is a safe “preview/download” level.
+ */
+function getMixTarget() {
+  return { I: -16, TP: -1.2, LRA: 12 };
+}
+
+/** Quick energy analysis using volumedetect on bands */
 function analyzeBands(wavPath) {
   const vol = (af) => {
     const out = runFfmpegAll([
@@ -72,9 +91,10 @@ function analyzeBands(wavPath) {
       "null",
       "-"
     ]);
-    const mean = parseNumberFrom(out, "mean_volume:");
-    const max = parseNumberFrom(out, "max_volume:");
-    return { mean, max };
+    return {
+      mean: parseNumberFrom(out, "mean_volume:"),
+      max: parseNumberFrom(out, "max_volume:")
+    };
   };
 
   const low = vol("lowpass=f=200");
@@ -112,51 +132,59 @@ function analyzeBands(wavPath) {
   return { profile, tags };
 }
 
+/**
+ * Adaptive tone fixes (tuned DOWN to avoid harsh processing)
+ * We’ll rely on loudnorm at the end for level consistency.
+ */
 function buildAdaptiveTone(tags) {
   const filters = [];
 
   if (tags.includes("low_end_weak")) {
-    filters.push("bass=g=6:f=100:w=0.6");
+    filters.push("bass=g=3.5:f=100:w=0.7");
   }
   if (tags.includes("low_end_heavy")) {
-    filters.push("bass=g=-4:f=110:w=0.7");
-    filters.push("equalizer=f=250:t=q:w=1:g=-2");
+    filters.push("bass=g=-3:f=110:w=0.8");
+    filters.push("equalizer=f=250:t=q:w=1:g=-1.5");
   }
   if (tags.includes("harsh_highs")) {
-    filters.push("treble=g=-4:f=9000:w=0.5");
+    filters.push("treble=g=-2.8:f=9000:w=0.6");
     filters.push("equalizer=f=3500:t=q:w=1:g=-1");
   }
   if (tags.includes("dull_highs")) {
-    filters.push("treble=g=3:f=9000:w=0.5");
+    filters.push("treble=g=2.0:f=9000:w=0.6");
   }
   if (tags.includes("mid_forward")) {
-    filters.push("equalizer=f=320:t=q:w=1:g=-3");
+    filters.push("equalizer=f=320:t=q:w=1:g=-2.0");
   }
 
   return filters;
 }
 
+/**
+ * Focus filters made AUDIBLE but safer:
+ * (Wide no longer explodes the level because loudnorm/limiter will catch it.)
+ */
 function getFocusFilters(focus) {
   switch (focus) {
     case "bass":
       return [
-        "bass=g=8:f=90:w=0.7",
-        "acompressor=threshold=-18dB:ratio=2.2:attack=20:release=140:makeup=2"
+        "bass=g=6:f=90:w=0.8",
+        "acompressor=threshold=-20dB:ratio=2.0:attack=25:release=160:makeup=1.2"
       ];
     case "presence":
       return [
-        "equalizer=f=3500:t=q:w=1:g=3.5",
-        "equalizer=f=6000:t=q:w=1:g=1.5"
+        "equalizer=f=3500:t=q:w=1:g=2.5",
+        "equalizer=f=6000:t=q:w=1:g=1.0"
       ];
     case "air":
-      return ["treble=g=5:f=10000:w=0.6"];
+      return ["treble=g=3.5:f=10000:w=0.7"];
     case "wide":
-      return ["stereotools=mlev=1:slev=1.45", "extrastereo=m=2.5"];
+      return ["stereotools=mlev=1:slev=1.35", "extrastereo=m=2.0"];
     case "punch":
       return [
-        "acompressor=threshold=-16dB:ratio=3:attack=6:release=70:makeup=3",
-        "equalizer=f=120:t=q:w=1:g=1.5",
-        "equalizer=f=3000:t=q:w=1:g=1.5"
+        "acompressor=threshold=-18dB:ratio=2.6:attack=8:release=90:makeup=1.5",
+        "equalizer=f=120:t=q:w=1:g=1.0",
+        "equalizer=f=3000:t=q:w=1:g=1.0"
       ];
     default:
       return [];
@@ -181,38 +209,40 @@ function buildTempoPitch(speedMultiplier, pitchSemitones) {
   ];
 }
 
-/**
- * Classification logging:
- * Append a single JSON object per line (NDJSON).
- * This is easy to import into a DB later.
- */
-function logClassification(event) {
-  const line = JSON.stringify(event) + "\n";
-  classificationEvents.push(event);
+/** Double-pass loudnorm helper */
+function loudnormMeasure(wavPath, target) {
+  const out = runFfmpegAll([
+    "-hide_banner",
+    "-nostats",
+    "-i",
+    wavPath,
+    "-af",
+    `loudnorm=I=${target.I}:TP=${target.TP}:LRA=${target.LRA}:print_format=json`,
+    "-f",
+    "null",
+    "-"
+  ]);
+  const m = parseLoudnormJson(out);
+  if (!m) throw new Error("Loudnorm measurement failed (JSON missing)");
+  return m;
+}
 
-  // keep memory bounded
-  if (classificationEvents.length > 500) classificationEvents.shift();
-
-  try {
-    fs.appendFileSync(CLASSIFICATION_LOG_PATH, line);
-  } catch {
-    // ignore for MVP (Render FS is ephemeral)
-  }
+function loudnormSecondPassFilter(target, measured) {
+  return (
+    `loudnorm=I=${target.I}:TP=${target.TP}:LRA=${target.LRA}:` +
+    `measured_I=${measured.input_i}:measured_TP=${measured.input_tp}:measured_LRA=${measured.input_lra}:` +
+    `measured_thresh=${measured.input_thresh}:offset=${measured.target_offset}:linear=true`
+  );
 }
 
 /* ---------------- ROUTES ---------------- */
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// Optional: quick view of recent events (for you only; lock later)
 app.get("/classification/recent", (req, res) => {
-  res.json({
-    count: classificationEvents.length,
-    events: classificationEvents.slice(-50)
-  });
+  res.json({ count: classificationEvents.length, events: classificationEvents.slice(-50) });
 });
 
-// Optional: download current NDJSON log (ephemeral but useful)
 app.get("/classification/export", (req, res) => {
   try {
     if (!fs.existsSync(CLASSIFICATION_LOG_PATH)) return res.status(404).send("No log file yet");
@@ -252,7 +282,6 @@ app.post("/enhance", async (req, res) => {
 
     const jobId = nanoid();
 
-    // Store request on job for later feedback + logging
     setJob(jobId, {
       status: "queued",
       createdAt: Date.now(),
@@ -275,8 +304,6 @@ app.post("/enhance", async (req, res) => {
       masterProfile
     }).catch((e) => {
       setJob(jobId, { status: "failed", error: e.message, failedAt: Date.now() });
-
-      // Log failed jobs too (very useful for later)
       logClassification({
         eventType: "render_failed",
         id: nanoid(),
@@ -307,13 +334,6 @@ app.get("/download/:id", (req, res) => {
   res.download(out, `enhanced-${req.params.id}.wav`);
 });
 
-/**
- * Feedback endpoint:
- * rating: "satisfied" | "not_satisfied"
- * reason: optional enum (too_bright, too_bassy, not_loud_enough, etc.)
- * notes: optional free text
- * userId: optional (from Base44 auth)
- */
 app.post("/feedback", (req, res) => {
   try {
     const body = req.body || {};
@@ -329,7 +349,6 @@ app.post("/feedback", (req, res) => {
     }
 
     const job = jobs.get(jobId);
-
     const event = {
       eventType: "feedback",
       id: nanoid(),
@@ -361,6 +380,7 @@ async function processJob(jobId, opts) {
 
   const raw = path.join(dir, "input.bin");
   const wav = path.join(dir, "decoded.wav");
+  const pre = path.join(dir, "pre.wav");
   const out = path.join(dir, "output.wav");
 
   const r = await fetch(opts.inputFileUrl);
@@ -370,7 +390,6 @@ async function processJob(jobId, opts) {
   setJob(jobId, { step: "Decoding & preparing audio..." });
   runFfmpegAll(["-y", "-i", raw, "-ac", "2", "-ar", "48000", wav]);
 
-  // ANALYSIS PASS (tone & dynamics proxy)
   setJob(jobId, { step: "Analyzing tone & dynamics..." });
   const bandAnalysis = analyzeBands(wav);
 
@@ -386,16 +405,14 @@ async function processJob(jobId, opts) {
     }
   });
 
-  // DECISION: build a render plan (this is your "classification result")
   const adaptiveTone = buildAdaptiveTone(bandAnalysis.tags);
-  const preGain = bandAnalysis.tags.includes("too_loud") ? ["volume=0.85"] : [];
   const tempoPitch = buildTempoPitch(opts.speedMultiplier, opts.pitchSemitones);
   const focusFilters = getFocusFilters(opts.focus);
 
+  // Render plan (logged + displayed)
   const renderPlan = {
     tags: bandAnalysis.tags,
     actions: {
-      preGainApplied: preGain.length > 0,
       adaptiveToneFilters: adaptiveTone,
       focus: opts.focus,
       focusFilters,
@@ -403,36 +420,42 @@ async function processJob(jobId, opts) {
       pitchSemitones: opts.pitchSemitones,
       enhancementType: opts.enhancementType,
       masterProfile: opts.masterProfile
+    },
+    safety: {
+      mixTarget: getMixTarget(),
+      masterTarget: getMasterTarget(opts.masterProfile)
     }
   };
-
   setJob(jobId, { renderPlan });
 
-  // Finishers
-  const finalLimiterMix = ["alimiter=limit=0.99:attack=5:release=80"];
-  const finalLimiterMaster = ["alimiter=limit=0.98:attack=2:release=50"];
-
+  // Step 1: apply "creative" processing to PRE file (no loudness forcing yet)
   if (opts.enhancementType === "mix") {
-    setJob(jobId, { step: "Building adaptive mix chain..." });
+    setJob(jobId, { step: "Applying mix enhancements (EQ/Dynamics/Space)..." });
 
-    const mixCore = [
+    // Mild compression (NO heavy makeup gain) to avoid saturation
+    const mixEnhance = [
       "highpass=f=30",
       "lowpass=f=18000",
-      "acompressor=threshold=-18dB:ratio=2.5:attack=18:release=120:makeup=3",
-      "stereotools=mlev=1:slev=1.18"
-    ];
-
-    const af = [
-      ...preGain,
-      ...mixCore,
+      "acompressor=threshold=-20dB:ratio=2.0:attack=25:release=160:makeup=1.0",
+      "stereotools=mlev=1:slev=1.12",
       ...adaptiveTone,
       ...focusFilters,
-      ...tempoPitch,
-      ...finalLimiterMix
+      ...tempoPitch
     ].filter(Boolean).join(",");
 
-    setJob(jobId, { step: "Rendering mix..." });
-    runFfmpegAll(["-y", "-i", wav, "-af", af, out]);
+    runFfmpegAll(["-y", "-i", wav, "-af", mixEnhance, pre]);
+
+    // Step 2: standards-based loudness + true-peak cap (double pass)
+    setJob(jobId, { step: "Balancing loudness & true peak (EBU R128)..." });
+    const target = getMixTarget();
+    const measured = loudnormMeasure(pre, target);
+    const ln2 = loudnormSecondPassFilter(target, measured);
+
+    // Safety limiter as final guard (should barely work)
+    const final = [ln2, "alimiter=limit=0.985:attack=2:release=60"].join(",");
+
+    setJob(jobId, { step: "Finalizing mix..." });
+    runFfmpegAll(["-y", "-i", pre, "-af", final, out]);
   }
 
   if (opts.enhancementType === "4d") {
@@ -440,65 +463,48 @@ async function processJob(jobId, opts) {
 
     const d4 = [
       "highpass=f=30",
-      "stereotools=mlev=1:slev=1.35",
-      "apulsator=hz=0.12:amount=0.35",
-      "aecho=0.8:0.85:40:0.12"
-    ];
-
-    const af = [
-      ...preGain,
-      ...d4,
+      "stereotools=mlev=1:slev=1.28",
+      "apulsator=hz=0.12:amount=0.30",
+      "aecho=0.8:0.85:40:0.10",
       ...adaptiveTone,
       ...focusFilters,
-      ...tempoPitch,
-      "alimiter=limit=0.98:attack=3:release=60"
+      ...tempoPitch
     ].filter(Boolean).join(",");
 
-    setJob(jobId, { step: "Rendering 4D output..." });
-    runFfmpegAll(["-y", "-i", wav, "-af", af, out]);
+    runFfmpegAll(["-y", "-i", wav, "-af", d4, pre]);
+
+    // keep 4D balanced too
+    setJob(jobId, { step: "Balancing loudness & true peak..." });
+    const target = getMixTarget();
+    const measured = loudnormMeasure(pre, target);
+    const ln2 = loudnormSecondPassFilter(target, measured);
+    const final = [ln2, "alimiter=limit=0.985:attack=2:release=60"].join(",");
+
+    setJob(jobId, { step: "Finalizing 4D output..." });
+    runFfmpegAll(["-y", "-i", pre, "-af", final, out]);
   }
 
   if (opts.enhancementType === "master") {
     setJob(jobId, { step: "Measuring loudness (LUFS/True Peak)..." });
+    const target = getMasterTarget(opts.masterProfile);
 
-    const t = getMasterTarget(opts.masterProfile);
-
-    const loudnormMeasureOut = runFfmpegAll([
-      "-hide_banner",
-      "-nostats",
-      "-i",
-      wav,
-      "-af",
-      `loudnorm=I=${t.I}:TP=${t.TP}:LRA=${t.LRA}:print_format=json`,
-      "-f",
-      "null",
-      "-"
-    ]);
-
-    const m = parseLoudnormJson(loudnormMeasureOut);
-    if (!m) throw new Error("Loudness analysis failed (loudnorm JSON missing)");
-
-    setJob(jobId, { step: "Applying adaptive mastering..." });
-
-    const masterPre = [
+    // Pre-master (gentle)
+    const preMaster = [
       "highpass=f=25",
-      "acompressor=threshold=-20dB:ratio=2:attack=10:release=100:makeup=2"
-    ];
-
-    const ln2 =
-      `loudnorm=I=${t.I}:TP=${t.TP}:LRA=${t.LRA}:` +
-      `measured_I=${m.input_i}:measured_TP=${m.input_tp}:measured_LRA=${m.input_lra}:` +
-      `measured_thresh=${m.input_thresh}:offset=${m.target_offset}:linear=true`;
-
-    const af = [
-      ...preGain,
-      ...masterPre,
+      "acompressor=threshold=-22dB:ratio=1.8:attack=15:release=120:makeup=1.0",
       ...adaptiveTone,
       ...focusFilters,
-      ...tempoPitch,
-      ln2,
-      ...finalLimiterMaster
+      ...tempoPitch
     ].filter(Boolean).join(",");
+
+    runFfmpegAll(["-y", "-i", wav, "-af", preMaster, pre]);
+
+    // Double-pass loudnorm to hit platform target safely (true peak cap)
+    setJob(jobId, { step: "Normalizing to platform target (EBU R128 / BS.1770)..." });
+    const measured = loudnormMeasure(pre, target);
+    const ln2 = loudnormSecondPassFilter(target, measured);
+
+    const final = [ln2, "alimiter=limit=0.985:attack=2:release=60"].join(",");
 
     setJob(jobId, {
       step:
@@ -511,12 +517,11 @@ async function processJob(jobId, opts) {
               : "Finalizing Spotify master..."
     });
 
-    runFfmpegAll(["-y", "-i", wav, "-af", af, out]);
+    runFfmpegAll(["-y", "-i", pre, "-af", final, out]);
   }
 
   if (!fs.existsSync(out)) throw new Error("Output missing after render");
 
-  // Log successful classification event (for future ML training)
   logClassification({
     eventType: "render_completed",
     id: nanoid(),
